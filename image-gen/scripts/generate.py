@@ -11,14 +11,14 @@ import urllib.error
 
 FUEL_BASE_URL = os.environ.get(
     "FUEL_BASE_URL",
-    "http://fuel-proxy-next.openclawrocks.svc.cluster.local:8080/v1"
+    "http://fuel-proxy.openclawrocks.svc.cluster.local:8080/v1"
 )
-BIFROST_VK = os.environ.get("FUEL_API_KEY", "")
+FUEL_API_KEY = os.environ.get("FUEL_API_KEY", "")
 
 
 def generate_image(prompt: str) -> str:
     """Send an image generation request to fuel-proxy and return the file path."""
-    if not BIFROST_VK:
+    if not FUEL_API_KEY:
         print("Error: FUEL_API_KEY is not set.", file=sys.stderr)
         sys.exit(1)
 
@@ -41,7 +41,7 @@ def generate_image(prompt: str) -> str:
         data=payload,
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {BIFROST_VK}"
+            "Authorization": f"Bearer {FUEL_API_KEY}"
         },
         method="POST"
     )
