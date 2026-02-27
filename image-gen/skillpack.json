@@ -1,0 +1,11 @@
+{
+  "files": {
+    "skills/image-gen/SKILL.md": "SKILL.md",
+    "skills/image-gen/scripts/generate.py": "scripts/generate.py"
+  },
+  "directories": ["skills/image-gen/scripts"],
+  "config": {
+    "image-gen": {"enabled": true},
+    "openai-image-gen": {"enabled": false}
+  }
+}
