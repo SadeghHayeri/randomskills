@@ -6,8 +6,8 @@ metadata:
     emoji: art
     requires:
       bins: ["python3"]
-      env: ["BIFROST_VIRTUAL_KEY"]
-    primaryEnv: BIFROST_VIRTUAL_KEY
+      env: ["FUEL_API_KEY"]
+    primaryEnv: FUEL_API_KEY
 ---
 
 # Image Generation
@@ -27,7 +27,7 @@ The script outputs a `MEDIA:<path>` line pointing to the generated image file.
 ## Requirements
 
 - `python3` (bundled in the OpenClaw container)
-- `BIFROST_VIRTUAL_KEY` environment variable (set automatically on Pro instances)
+- `FUEL_API_KEY` environment variable (set automatically on Pro instances)
 
 ## How it works
 

@@ -13,13 +13,13 @@ FUEL_BASE_URL = os.environ.get(
     "FUEL_BASE_URL",
     "http://fuel-proxy-next.openclawrocks.svc.cluster.local:8080/v1"
 )
-BIFROST_VK = os.environ.get("BIFROST_VIRTUAL_KEY", "")
+BIFROST_VK = os.environ.get("FUEL_API_KEY", "")
 
 
 def generate_image(prompt: str) -> str:
     """Send an image generation request to fuel-proxy and return the file path."""
     if not BIFROST_VK:
-        print("Error: BIFROST_VIRTUAL_KEY is not set.", file=sys.stderr)
+        print("Error: FUEL_API_KEY is not set.", file=sys.stderr)
         sys.exit(1)
 
     url = f"{FUEL_BASE_URL}/chat/completions"
