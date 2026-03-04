@@ -1,0 +1,10 @@
+{
+  "files": {
+    "skills/clawme-gmail/SKILL.md": "SKILL.md",
+    "skills/clawme-gmail/scripts/clawme": "scripts/clawme"
+  },
+  "directories": ["skills/clawme-gmail/scripts"],
+  "config": {
+    "clawme-gmail": {"enabled": true}
+  }
+}

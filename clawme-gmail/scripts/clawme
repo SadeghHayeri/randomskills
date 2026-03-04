@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+"""clawme — Integration-aware CLI for OpenClaw instances.
+
+Usage:
+    clawme [--scopes SCOPE...] gog [GOG_ARGS...]
+    clawme list [--json]
+    clawme gmail-watch start
+    clawme gmail-watch stop [--email EMAIL]
+    clawme gmail-watch status [--json]
+
+Provider aliases:
+    gog / google  →  google
+
+Environment variables (injected automatically by the operator):
+    OPENCLAW_PLATFORM_URL      Base URL of the platform API (e.g. https://api.clawme.io)
+    OPENCLAW_PLATFORM_API_KEY  Instance API key for authentication
+    OPENCLAW_FRONTEND_URL      Base URL of the user-facing frontend (default: https://clawme.io)
+
+Exit codes:
+    0  Success
+    1  Error (network failure, API error, unknown provider)
+    2  Needs reconnect — token was revoked; user must re-authorize
+    3  Not connected — integration has never been set up
+"""
+
+import json
+import os
+import pathlib
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+PLATFORM_URL = os.environ.get("OPENCLAW_PLATFORM_URL", "https://api.clawme.io").rstrip("/")
+FRONTEND_URL = os.environ.get("OPENCLAW_FRONTEND_URL", "https://clawme.io").rstrip("/")
+API_KEY = os.environ.get("OPENCLAW_PLATFORM_API_KEY", "")
+
+HOME = pathlib.Path.home()
+OPENCLAW_DIR = HOME / ".openclaw"
+GOG_CREDS_FILE = OPENCLAW_DIR / ".config" / "gog" / "credentials.json"
+GMAIL_PROCESSED_FILE = OPENCLAW_DIR / "gmail-processed.json"
+GMAIL_WEBHOOK_TOKEN_FILE = OPENCLAW_DIR / "gmail-webhook-token"
+HOOKS_DIR = OPENCLAW_DIR / "hooks"
+TRANSFORMS_DIR = HOOKS_DIR / "transforms"
+OPENCLAW_CONFIG_FILE = OPENCLAW_DIR / "config.yml"
+GATEWAY_PORT = int(os.environ.get("OPENCLAW_GATEWAY_PORT", "80"))
+HOOKS_TOKEN = os.environ.get("OPENCLAW_HOOKS_TOKEN", "")
+
+PROVIDER_ALIASES: dict[str, str] = {
+    "gog": "google",
+    "google": "google",
+}
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+class _NeedsReconnect(Exception):
+    pass
+
+
+def _request(path: str, method: str = "GET", body: dict | None = None) -> object:
+    """Make a request to the platform API with the instance API key."""
+    if not API_KEY:
+        print("Error: OPENCLAW_PLATFORM_API_KEY is not set.", file=sys.stderr)
+        sys.exit(1)
+
+    url = f"{PLATFORM_URL}{path}"
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method=method,
+        headers={
+            "X-Instance-API-Key": API_KEY,
+            **({"Content-Type": "application/json"} if data else {}),
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw = resp.read()
+            return json.loads(raw) if raw else None
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode(errors="replace")
+        if e.code == 401:
+            raise _NeedsReconnect(body_text)
+        print(f"API error {e.code}: {body_text}", file=sys.stderr)
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        print(f"Network error: {e.reason}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _integration_url(provider: str, scopes: list[str] | None = None) -> str:
+    base = f"{FRONTEND_URL}/integrations"
+    if scopes:
+        params = urllib.parse.urlencode({"connect": provider, "scopes": ",".join(scopes)})
+        return f"{base}?{params}"
+    return base
+
+
+def _store_gog_credentials(access_token: str, account_id: str | None) -> None:
+    """Store Google OAuth access token where gog expects it."""
+    GOG_CREDS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    GOG_CREDS_FILE.write_text(
+        json.dumps({"access_token": access_token, "account": account_id or ""}),
+        encoding="utf-8",
+    )
+    # Also set env var for tools that read it directly
+    os.environ["GOOGLE_OAUTH_ACCESS_TOKEN"] = access_token
+    os.environ["GOOGLE_ACCESS_TOKEN"] = access_token
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def cmd_gog(gog_args: list[str], scopes: list[str]) -> None:
+    """Fetch Google OAuth credentials, store them, then exec gog with remaining args.
+
+    With --scopes: validates the connected credential has those scopes before exec.
+    Without --scopes: exec gog immediately after storing credentials.
+    """
+    connections = _request("/api/instance/integrations")
+    conn = next((c for c in connections if c["provider"] == "google"), None)
+    url = _integration_url("google", scopes or None)
+
+    if not conn:
+        print("Google is not connected.", file=sys.stderr)
+        print(f"Set it up at: {url}", file=sys.stderr)
+        sys.exit(3)
+
+    if conn.get("needs_reconnect"):
+        print("Google connection has expired and needs re-authorization.", file=sys.stderr)
+        print(f"Reconnect at: {url}", file=sys.stderr)
+        sys.exit(2)
+
+    # Scope validation
+    if scopes:
+        granted = set(conn.get("scopes") or [])
+        missing = [s for s in scopes if s not in granted]
+        if missing:
+            print(
+                f"Missing scopes: {', '.join(missing)}. Grant them at: {url}",
+                file=sys.stderr,
+            )
+            sys.exit(3)
+
+    # Fetch a fresh access token
+    try:
+        token_data = _request("/api/instance/integrations/google/token")
+    except _NeedsReconnect:
+        print("Google connection has expired and needs re-authorization.", file=sys.stderr)
+        print(f"Reconnect at: {url}", file=sys.stderr)
+        sys.exit(2)
+
+    _store_gog_credentials(token_data["access_token"], conn.get("account_id"))
+
+    # Hand off to gog binary
+    gog_bin = "gog"
+    os.execvp(gog_bin, [gog_bin] + gog_args)
+
+
+def cmd_gmail_watch(subcmd: str, email: str | None, as_json: bool) -> None:
+    """Manage Gmail push-notification watches.
+
+    start  — register a watch, write transform script, configure hooks
+    stop   — unregister one (--email) or all watches
+    status — list active watches
+    """
+    if subcmd == "start":
+        _gmail_watch_start()
+
+    elif subcmd == "stop":
+        path = "/api/instance/integrations/gmail/watch"
+        if email:
+            path += f"?email={urllib.parse.quote(email)}"
+        _request(path, method="DELETE")
+
+        # If no watches remain, clean up transform + token files
+        remaining = _request("/api/instance/integrations/gmail/watch") or []
+        if not remaining:
+            if TRANSFORMS_DIR.joinpath("clawme-gmail.js").exists():
+                TRANSFORMS_DIR.joinpath("clawme-gmail.js").unlink()
+            if GMAIL_WEBHOOK_TOKEN_FILE.exists():
+                GMAIL_WEBHOOK_TOKEN_FILE.unlink()
+        msg = f"Watch stopped for {email}." if email else "All Gmail watches stopped."
+        print(msg)
+
+    elif subcmd == "status":
+        data = _request("/api/instance/integrations/gmail/watch") or []
+        if as_json:
+            print(json.dumps(data, indent=2))
+        elif not data:
+            print("No active Gmail watches.")
+        else:
+            print(f"{'EMAIL':<40} {'EXPIRATION':<30} STATUS")
+            print("-" * 80)
+            for w in data:
+                status = "active" if w.get("active") else "inactive"
+                print(f"{w['email_address']:<40} {w['expiration']:<30} {status}")
+
+    else:
+        print(f"Unknown gmail-watch subcommand: {subcmd!r}. Use: start, stop, status", file=sys.stderr)
+        sys.exit(1)
+
+
+def _gmail_watch_start() -> None:
+    """Register watch with platform and set up the transform + hooks config."""
+    try:
+        data = _request("/api/instance/integrations/gmail/watch", method="POST", body={})
+    except _NeedsReconnect:
+        url = _integration_url("google", ["gmail:readonly"])
+        print("Google connection has expired. Reconnect at:", url, file=sys.stderr)
+        sys.exit(2)
+
+    if not data:
+        print("Error: empty response from platform", file=sys.stderr)
+        sys.exit(1)
+
+    email_address = data["email_address"]
+    expiration = data["expiration"]
+    webhook_token = data["webhook_token"]
+
+    # Persist webhook token for the transform script
+    OPENCLAW_DIR.mkdir(parents=True, exist_ok=True)
+    GMAIL_WEBHOOK_TOKEN_FILE.write_text(webhook_token, encoding="utf-8")
+    GMAIL_WEBHOOK_TOKEN_FILE.chmod(0o600)
+
+    # Write transform script
+    TRANSFORMS_DIR.mkdir(parents=True, exist_ok=True)
+    _write_transform(TRANSFORMS_DIR / "clawme-gmail.js", webhook_token)
+
+    # Ensure hooks are enabled in config.yml
+    _enable_hooks_config()
+
+    print(f"Watching {email_address}")
+    print(f"Expires: {expiration}")
+    print(f"Transform: {TRANSFORMS_DIR / 'clawme-gmail.js'}")
+
+
+def _write_transform(path: pathlib.Path, webhook_token: str) -> None:
+    """Write the clawme-gmail webhook transform script."""
+    script = f"""\
+// clawme-gmail transform — auto-generated by `clawme gmail-watch start`
+// Receives Pub/Sub notifications from the ClawMe platform and:
+//   1. Validates the platform auth token
+//   2. Deduplicates history IDs (persisted in {GMAIL_PROCESSED_FILE})
+//   3. Enriches via `clawme gog` to fetch actual email content
+//   4. Forwards each new email to /hooks/gmail for agent processing
+
+import {{ execSync, spawnSync }} from "child_process";
+import fs from "fs";
+import http from "http";
+
+const WEBHOOK_TOKEN = {json.dumps(webhook_token)};
+const PROCESSED_FILE = {json.dumps(str(GMAIL_PROCESSED_FILE))};
+const GATEWAY_PORT = {GATEWAY_PORT};
+
+function loadProcessed() {{
+  try {{ return new Set(JSON.parse(fs.readFileSync(PROCESSED_FILE, "utf8"))); }}
+  catch {{ return new Set(); }}
+}}
+
+function saveProcessed(set) {{
+  fs.writeFileSync(PROCESSED_FILE, JSON.stringify([...set]), "utf8");
+}}
+
+function gogRun(...args) {{
+  const result = spawnSync("clawme", ["--scopes", "gmail:readonly", "gog", ...args], {{
+    encoding: "utf8",
+    timeout: 30000,
+  }});
+  if (result.status !== 0) throw new Error(result.stderr || "gog failed");
+  return JSON.parse(result.stdout);
+}}
+
+function postToGmailHook(email) {{
+  return new Promise((resolve) => {{
+    const body = JSON.stringify(email);
+    const req = http.request(
+      {{ hostname: "localhost", port: GATEWAY_PORT, path: "/hooks/gmail", method: "POST",
+        headers: {{ "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) }} }},
+      (res) => {{ res.resume(); resolve(res.statusCode); }}
+    );
+    req.on("error", () => resolve(0));
+    req.write(body);
+    req.end();
+  }});
+}}
+
+export default async function(payload) {{
+  // 1. Auth
+  const auth = payload.headers?.authorization ?? payload.headers?.Authorization ?? "";
+  if (auth !== `Bearer ${{WEBHOOK_TOKEN}}`) return null;
+
+  const {{ history_id, email_address }} = payload.body ?? {{}};
+  if (!history_id) return null;
+
+  // 2. Dedup
+  const processed = loadProcessed();
+  if (processed.has(history_id)) return null;
+
+  // 3. Enrich: fetch messages since this historyId
+  let messages = [];
+  try {{
+    const history = gogRun(
+      "users", "history", "list",
+      "--user-id=me",
+      `--start-history-id=${{history_id}}`,
+      "--history-types=messageAdded",
+      "--format=json",
+    );
+    const added = (history.history ?? []).flatMap((h) => h.messagesAdded ?? []);
+    for (const {{ message }} of added) {{
+      const msg = gogRun(
+        "users", "messages", "get",
+        "--user-id=me",
+        `--id=${{message.id}}`,
+        "--format=json",
+      );
+      const headers = Object.fromEntries(
+        (msg.payload?.headers ?? []).map((h) => [h.name.toLowerCase(), h.value])
+      );
+      messages.push({{
+        id: message.id,
+        email_address,
+        from: headers.from ?? "",
+        to: headers.to ?? "",
+        subject: headers.subject ?? "(no subject)",
+        date: headers.date ?? "",
+        snippet: msg.snippet ?? "",
+      }});
+    }}
+  }} catch (err) {{
+    console.error("clawme-gmail: enrich failed:", err.message);
+    return null;
+  }}
+
+  // 4. Mark processed and forward
+  processed.add(history_id);
+  saveProcessed(processed);
+
+  for (const email of messages) {{
+    await postToGmailHook(email);
+  }}
+
+  return null; // transform handled delivery itself
+}}
+"""
+    path.write_text(script, encoding="utf-8")
+
+
+def _enable_hooks_config() -> None:
+    """Ensure hooks.enabled=true, hooks.token, and transformsDir are set in config.yml.
+
+    Uses a simple line-based approach to avoid requiring a YAML library.
+    If the config already has hooks settings, leave them untouched.
+    """
+    if not HOOKS_TOKEN:
+        print(
+            "Warning: OPENCLAW_HOOKS_TOKEN is not set. "
+            "hooks.token will be missing from config — the gateway may refuse to start.",
+            file=sys.stderr,
+        )
+
+    transforms_path = str(TRANSFORMS_DIR)
+
+    content = ""
+    if OPENCLAW_CONFIG_FILE.exists():
+        content = OPENCLAW_CONFIG_FILE.read_text(encoding="utf-8")
+
+    if "hooks:" in content:
+        # Hooks section exists — patch in token if it's missing
+        if HOOKS_TOKEN and HOOKS_TOKEN not in content:
+            lines = content.splitlines(keepends=True)
+            for i, line in enumerate(lines):
+                if line.strip() == "hooks:":
+                    lines.insert(i + 1, f'  token: "{HOOKS_TOKEN}"\n')
+                    break
+            OPENCLAW_CONFIG_FILE.write_text("".join(lines), encoding="utf-8")
+        return
+
+    addition = f"""
+hooks:
+  enabled: true
+  token: "{HOOKS_TOKEN}"
+  transformsDir: "{transforms_path}"
+"""
+    OPENCLAW_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    OPENCLAW_CONFIG_FILE.write_text(content + addition, encoding="utf-8")
+
+
+def cmd_list(as_json: bool) -> None:
+    """List all connected integrations for this instance."""
+    connections = _request("/api/instance/integrations")
+
+    if as_json:
+        print(json.dumps(connections, indent=2))
+        return
+
+    if not connections:
+        print("No integrations connected.")
+        return
+
+    for c in connections:
+        if c.get("needs_reconnect"):
+            status = "✗ needs reconnect"
+        elif c.get("connected"):
+            status = "✓ connected"
+        else:
+            status = "✗ disconnected"
+
+        scopes = ", ".join(c.get("scopes") or []) or "no scopes"
+        account = c.get("account_id") or "unknown account"
+        print(f"  {c['provider']:<12} {status:<20} {account:<30} [{scopes}]")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    args = sys.argv[1:]
+
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__)
+        sys.exit(0)
+
+    as_json = "--json" in args
+    args = [a for a in args if a != "--json"]
+
+    # Parse top-level --scopes (consumed before command dispatch)
+    scopes: list[str] = []
+    if "--scopes" in args:
+        idx = args.index("--scopes")
+        args.pop(idx)
+        while idx < len(args) and not args[idx].startswith("--"):
+            scopes.append(args.pop(idx))
+
+    cmd = args[0] if args else ""
+    rest = args[1:]
+
+    if cmd == "list":
+        cmd_list(as_json=as_json)
+
+    elif cmd == "gmail-watch":
+        subcmd = rest[0] if rest else ""
+        if not subcmd:
+            print("Usage: clawme gmail-watch <start|stop|status>", file=sys.stderr)
+            sys.exit(1)
+        email = None
+        if "--email" in rest:
+            idx = rest.index("--email")
+            rest.pop(idx)
+            email = rest.pop(idx) if idx < len(rest) else None
+        cmd_gmail_watch(subcmd, email=email, as_json=as_json)
+
+    elif cmd in PROVIDER_ALIASES:
+        # `clawme [--scopes ...] gog [gog args...]`
+        cmd_gog(gog_args=rest, scopes=scopes)
+
+    else:
+        known = "list, gmail-watch, " + ", ".join(sorted(set(PROVIDER_ALIASES)))
+        print(f"Unknown command: {cmd!r}. Available: {known}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
