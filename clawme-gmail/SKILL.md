@@ -33,10 +33,9 @@ what to relay to the user if they need to authorize or reconnect.
 
 ## Commands
 
-### Read Gmail messages
+### Read Gmail messages (simple)
 
-Use `clawme gmail` to search and read emails directly via the platform OAuth token.
-No separate credentials needed - it uses the connected Google account automatically.
+Use `clawme gmail` for quick email access — calls Gmail REST API directly.
 
 ```bash
 clawme gmail search "<query>" [--max=N] [--json]
@@ -47,15 +46,49 @@ clawme gmail get <message-id> [--json]
 Examples:
 
 ```bash
-# Search inbox for recent emails
 clawme gmail search "in:inbox" --max=5 --json
-
-# Find unread emails
 clawme gmail search "is:unread" --max=10 --json
-
-# Get a specific message
 clawme gmail get 19ccf256a06ae6db --json
 ```
+
+### Run any `gog` command (full Google API access)
+
+`clawme gog` passes a fresh OAuth access token directly to `gog` via `--access-token`.
+**All `gog` subcommands work transparently.** No keyring or client credentials needed.
+
+```bash
+clawme gog <any gog subcommand and args>
+```
+
+Examples:
+
+```bash
+clawme gog gmail search "in:inbox" --max 5
+clawme gog calendar list
+clawme gog drive list
+```
+
+Validate scopes before running (optional but recommended):
+
+```bash
+clawme --scopes gmail:readonly gog gmail search "in:inbox"
+clawme --scopes calendar:readwrite gog calendar create ...
+```
+
+Available scope keys:
+
+| Key | Access |
+|-----|--------|
+| `calendar:readonly` | Read calendar events |
+| `calendar:readwrite` | Read and write calendar events |
+| `drive:readonly` | Read Drive files |
+| `drive:readwrite` | Read and write Drive files |
+| `docs:readonly` | Read Google Docs |
+| `docs:readwrite` | Read and write Google Docs |
+| `sheets:readonly` | Read Google Sheets |
+| `sheets:readwrite` | Read and write Google Sheets |
+| `gmail:readonly` | Read Gmail messages |
+| `gmail:readwrite` | Send and modify Gmail messages |
 
 ### List all connected integrations
 
@@ -76,13 +109,13 @@ clawme list --json
 On exit codes 2 and 3, the URL in stderr already contains the right scopes so the user
 just clicks it and the authorization starts automatically.
 
-## Example — read Gmail messages
+## Example — read Gmail messages via gog
 
 ```bash
-clawme gmail search "in:inbox" --max=5 --json
+clawme gog gmail search "in:inbox" --max 5
 ```
 
-The platform provides a fresh OAuth token automatically - no token management needed.
+The platform provides a fresh OAuth token automatically — no keyring or client credentials needed.
 
 ## Gmail watch — real-time push notifications
 
