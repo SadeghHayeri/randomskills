@@ -109,8 +109,10 @@ Use `gmail-watch` when the user wants the agent to react to incoming emails auto
 
 The platform manages Pub/Sub infrastructure. When a new email arrives, the platform pushes
 a notification directly to this instance's `/hooks/clawme-gmail` endpoint. The transform
-script deduplicates, enriches the email via `gog`, and forwards it to `/hooks/gmail`
-for agent processing — **no polling required**.
+fetches the email from the Gmail REST API and delivers it to the agent as a prompt — **no
+polling required**.
+
+**Prerequisites:** Google must be connected with `gmail:readwrite` scope.
 
 ### Commands
 
@@ -122,9 +124,9 @@ clawme gmail-watch start
 
 This:
 1. Registers a push-notification watch with the platform for your connected Google account
-2. Writes `~/.openclaw/hooks/transforms/clawme-gmail.js` (dedup + enrich transform)
+2. Writes `~/.openclaw/hooks/transforms/clawme-gmail.js` (auth + dedup + email fetch transform)
 3. Enables `hooks` in `~/.openclaw/config.yml` if not already set
-4. Saves the webhook authentication token to `~/.openclaw/gmail-webhook-token`
+4. Patches the hooks mapping in the CRD config via selfconfig
 
 The watch lasts ~7 days. The platform auto-renews it in the background.
 
@@ -142,22 +144,26 @@ clawme gmail-watch stop                   # stop all watches
 clawme gmail-watch stop --email a@b.com  # stop one specific email
 ```
 
-If no watches remain, the transform script and token file are cleaned up automatically.
-
 ### How the push flow works
 
 ```
-Gmail → GCP Pub/Sub → Platform /webhooks/gmail
-  → looks up instances watching that email
-  → POST http://{instance-name}:{port}/hooks/clawme-gmail
-      { email_address, history_id }
+Gmail → GCP Pub/Sub → Platform
+  → POST /hooks/clawme-gmail on this instance
+      { history_id, email_address }
+      Authorization: Bearer <OPENCLAW_HOOKS_TOKEN>
   → clawme-gmail.js transform:
-      1. validate webhook_token
+      1. validate auth (OPENCLAW_HOOKS_TOKEN)
       2. dedup (skip if history_id already processed)
-      3. clawme --scopes gmail:readonly gog users history list --start-history-id=...
-      4. clawme --scopes gmail:readonly gog users messages get --id=... --format=json
-      5. POST http://localhost:{port}/hooks/gmail  ← agent event
+      3. GET /api/instance/integrations/google/token  (fresh OAuth token)
+      4. GET /gmail/v1/users/me/history?startHistoryId=...&maxResults=1
+      5. GET /gmail/v1/users/me/messages/{id}?format=full
+      6. return { message: "<formatted email>" }  → agent handles it
 ```
+
+The transform returns `null` (no agent triggered) when:
+- Auth validation fails
+- history_id was already processed (dedup)
+- No new messages found for this history ID
 
 ### Exit codes for gmail-watch
 
@@ -169,8 +175,9 @@ Gmail → GCP Pub/Sub → Platform /webhooks/gmail
 
 ## Notes
 
-- Tokens are automatically refreshed by the platform — `clawme gog` always provides a valid credential.
-- If the user revokes access in their Google account, you will get exit code 2. Always relay the reconnect URL.
+- `gmail:readwrite` scope is required for gmail-watch (readwrite is needed even for read-only watching).
+- The transform authenticates webhook POSTs using `OPENCLAW_HOOKS_TOKEN` (env var set by the platform).
+- Email fetch uses the platform API token endpoint, not `clawme gog` — no separate binary needed.
 - `clawme` is different from `platform.py`: `clawme` is the high-level integration runner;
   `platform.py` is the low-level raw API tool. Prefer `clawme` for all integration work.
 - One instance can watch multiple email addresses. One email can be watched by multiple instances.
